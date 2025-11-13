@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import unicodedata
 import re
+import altair as alt
 
 # ================== CONFIG ================== #
 
@@ -18,7 +19,7 @@ TARGET_VIEWS = [
 FAC_ORDER = ["UPC", "UPEC", "UPS", "UVSQ", "SU", "USPN"]
 FAC_DISPLAY = {
     "UPC": "UPC",
-    "UPEC": "UPEC",   # <== demandé
+    "UPEC": "UPEC",   # demandé
     "UPS": "UPS",
     "UVSQ": "UVSQ",
     "SU": "SU",
@@ -229,6 +230,8 @@ def build_views(
     pseudo_col: str | None,
     pairs: dict[str, tuple[str, str]],
 ):
+    """Vues <3/5 par catégorie.
+       IMPORTANT : on enlève Email & Pseudo pour la lisibilité."""
     sheets: dict[str, pd.DataFrame] = {}
     for display, (note_col, comm_col) in pairs.items():
         cols = [
@@ -261,9 +264,10 @@ def build_views(
         temp["__note_num"] = temp["Note"].map(parse_note)
         temp = temp[temp["__note_num"] < 3.0].drop(columns="__note_num")
 
+        # On enlève Email & Pseudo ici pour gagner de la place
         ordered = [
             c
-            for c in ["Prénom", "Nom", "Email", "Pseudo", "Fac", "Note", "Commentaire"]
+            for c in ["Prénom", "Nom", "Fac", "Note", "Commentaire"]
             if c in temp.columns
         ]
         sheets[display] = temp[ordered]
@@ -278,15 +282,26 @@ def build_commentaires_view(
     nom_col: str | None,
     email_col: str | None,
     pseudo_col: str | None,
+    pairs: dict[str, tuple[str, str]],
 ) -> pd.DataFrame:
-    comment_cols = [c for c in df.columns if _is_comment_col(normalize(c))]
+    """Tous les élèves ayant laissé au moins un commentaire.
+       Chaque commentaire sur une nouvelle ligne,
+       avec le nom de la section (Coaching, Professeurs, etc.)."""
+
+    # Map colonne commentaire -> nom de vue (Coaching, Professeurs, etc.)
+    comment_map = {}  # {comment_col: "Coaching"}
+    for display, (_, comm_col) in pairs.items():
+        if comm_col in df.columns:
+            comment_map[comm_col] = display
+
     rows = []
     for _, r in df.iterrows():
         comments = []
-        for col in comment_cols:
-            val = r.get(col)
+        for comm_col, display_name in comment_map.items():
+            val = r.get(comm_col)
             if isinstance(val, str) and val.strip():
-                comments.append(f"{col}: {val.strip()}")
+                comments.append(f"{display_name} :\n{val.strip()}")
+
         if not comments:
             continue
 
@@ -295,10 +310,8 @@ def build_commentaires_view(
             {
                 "Prénom": r.get(prenom_col, ""),
                 "Nom": r.get(nom_col, ""),
-                "Email": r.get(email_col, ""),
-                "Pseudo": r.get(pseudo_col, ""),
                 "Fac": FAC_DISPLAY.get(fac, fac) if fac else "",
-                "Commentaires": "\n".join(comments),
+                "Commentaires": "\n\n".join(comments),
             }
         )
     return pd.DataFrame(rows)
@@ -313,7 +326,7 @@ def build_recommandations_view(
 ) -> pd.DataFrame:
     if RECO_COL_EXACT not in df.columns:
         return pd.DataFrame(
-            columns=["Prénom", "Nom", "Email", "Pseudo", "Fac", "Recommandation"]
+            columns=["Prénom", "Nom", "Fac", "Recommandation"]
         )
 
     rows = []
@@ -325,8 +338,6 @@ def build_recommandations_view(
                 {
                     "Prénom": r.get(prenom_col, ""),
                     "Nom": r.get(nom_col, ""),
-                    "Email": r.get(email_col, ""),
-                    "Pseudo": r.get(pseudo_col, ""),
                     "Fac": FAC_DISPLAY.get(fac, fac) if fac else "",
                     "Recommandation": rec.strip(),
                 }
@@ -379,6 +390,20 @@ def build_tous_les_eleves(
 
 st.set_page_config(page_title="Feedback PASS", layout="wide")
 
+# Petit style pour rendre le tout plus agréable
+st.markdown("""
+<style>
+.block {
+    background-color: #f8f9fc;
+    padding: 20px;
+    border-radius: 14px;
+    margin-bottom: 25px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.05);
+}
+.dataframe { border-radius: 12px; overflow: hidden; }
+</style>
+""", unsafe_allow_html=True)
+
 st.markdown(
     "<h1 style='text-align:center;'>📊 Dashboard de satisfaction – Diploma Santé</h1>",
     unsafe_allow_html=True,
@@ -386,7 +411,7 @@ st.markdown(
 st.write(
     "Dépose l’export Excel du formulaire : la plateforme te donne directement "
     "les moyennes par fac, les élèves en difficulté, tous les commentaires, les recommandations, "
-    "et un classement des élèves par moyenne globale."
+    "un classement des élèves par moyenne globale, et des graphiques de synthèse."
 )
 
 uploaded = st.file_uploader("Fichier Excel exporté (.xlsx ou .xls)", type=["xlsx", "xls"])
@@ -420,7 +445,7 @@ if not pairs:
 
 df_avg = compute_averages_by_fac(df, pairs, pseudo_col, prenom_col, nom_col, email_col)
 standard_views = build_views(df, prenom_col, nom_col, email_col, pseudo_col, pairs)
-commentaires_df = build_commentaires_view(df, prenom_col, nom_col, email_col, pseudo_col)
+commentaires_df = build_commentaires_view(df, prenom_col, nom_col, email_col, pseudo_col, pairs)
 reco_df = build_recommandations_view(df, prenom_col, nom_col, email_col, pseudo_col)
 tous_eleves_df = build_tous_les_eleves(df, prenom_col, nom_col, email_col, pseudo_col, pairs)
 
@@ -441,15 +466,18 @@ with col3:
 
 # ========== TABS ========== #
 
-tab_moyennes, tab_vues, tab_comments, tab_reco, tab_eleves = st.tabs(
-    ["📈 Moyennes par fac", "⚠️ Vues < 3/5", "💬 Commentaires", "📝 Recommandations", "👥 Tous les élèves"]
+tab_moyennes, tab_vues, tab_comments, tab_reco, tab_eleves, tab_graphs = st.tabs(
+    ["📈 Moyennes par fac", "⚠️ Vues < 3/5", "💬 Commentaires", "📝 Recommandations", "👥 Tous les élèves", "📊 Graphiques"]
 )
 
 with tab_moyennes:
+    st.markdown("<div class='block'>", unsafe_allow_html=True)
     st.subheader("Moyennes par fac et par catégorie")
     st.dataframe(df_avg, use_container_width=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
 with tab_vues:
+    st.markdown("<div class='block'>", unsafe_allow_html=True)
     st.subheader("Élèves avec note < 3/5 par catégorie")
     vue_name = st.selectbox(
         "Choisis une catégorie",
@@ -467,8 +495,10 @@ with tab_vues:
         if fac_filter:
             df_affiche = df_affiche[df_affiche["Fac"].isin(fac_filter)]
         st.dataframe(df_affiche, use_container_width=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
 with tab_comments:
+    st.markdown("<div class='block'>", unsafe_allow_html=True)
     st.subheader("Tous les élèves ayant laissé au moins un commentaire")
     if commentaires_df.empty:
         st.info("Aucun commentaire détecté.")
@@ -480,8 +510,10 @@ with tab_comments:
         if fac_filter:
             df_affiche = df_affiche[df_affiche["Fac"].isin(fac_filter)]
         st.dataframe(df_affiche, use_container_width=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
 with tab_reco:
+    st.markdown("<div class='block'>", unsafe_allow_html=True)
     st.subheader("Recommandations / besoins avant le concours")
     if reco_df.empty:
         st.info("Aucune recommandation trouvée dans le champ dédié.")
@@ -493,8 +525,10 @@ with tab_reco:
         if fac_filter:
             df_affiche = df_affiche[df_affiche["Fac"].isin(fac_filter)]
         st.dataframe(df_affiche, use_container_width=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
 with tab_eleves:
+    st.markdown("<div class='block'>", unsafe_allow_html=True)
     st.subheader("Tous les élèves – classement par moyenne globale (croissant)")
     if tous_eleves_df.empty:
         st.info("Aucune donnée pour calculer les moyennes.")
@@ -509,3 +543,48 @@ with tab_eleves:
             df_affiche[["Prénom", "Nom", "Fac", "Moyenne globale /5", "Pseudo", "Email"]],
             use_container_width=True,
         )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+with tab_graphs:
+    st.markdown("<div class='block'>", unsafe_allow_html=True)
+    st.subheader("Histogramme des moyennes des élèves (A2)")
+
+    moy_series = tous_eleves_df["Moyenne globale /5"].dropna()
+    if moy_series.empty:
+        st.info("Pas assez de données pour tracer l'histogramme des moyennes.")
+    else:
+        hist_df = pd.DataFrame({"Moyenne": moy_series})
+        chart_hist = (
+            alt.Chart(hist_df)
+            .mark_bar()
+            .encode(
+                x=alt.X("Moyenne:Q", bin=alt.Bin(maxbins=15), title="Moyenne sur 5"),
+                y=alt.Y("count():Q", title="Nombre d'élèves"),
+                tooltip=["count():Q"]
+            )
+            .properties(height=300)
+        )
+        st.altair_chart(chart_hist, use_container_width=True)
+
+    st.markdown("---")
+    st.subheader("Comparaison des moyennes par catégorie et par fac (D8)")
+
+    long_df = df_avg.melt(id_vars="Catégorie", var_name="Fac", value_name="Moyenne")
+    long_df = long_df.dropna(subset=["Moyenne"])
+    if long_df.empty:
+        st.info("Pas assez de données pour tracer le comparatif par fac.")
+    else:
+        chart_bar = (
+            alt.Chart(long_df)
+            .mark_bar()
+            .encode(
+                x=alt.X("Catégorie:N", sort=None, title="Catégorie"),
+                y=alt.Y("Moyenne:Q", title="Moyenne /5"),
+                color=alt.Color("Fac:N", title="Fac"),
+                tooltip=["Catégorie", "Fac", "Moyenne"]
+            )
+            .properties(height=350)
+        )
+        st.altair_chart(chart_bar, use_container_width=True)
+
+    st.markdown("</div>", unsafe_allow_html=True)
