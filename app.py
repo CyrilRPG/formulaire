@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import unicodedata
 import re
-from io import BytesIO
 
 # ================== CONFIG ================== #
 
@@ -19,7 +18,7 @@ TARGET_VIEWS = [
 FAC_ORDER = ["UPC", "UPEC", "UPS", "UVSQ", "SU", "USPN"]
 FAC_DISPLAY = {
     "UPC": "UPC",
-    "UPEC": "UPEC L1",
+    "UPEC": "UPEC",   # <== demandé
     "UPS": "UPS",
     "UVSQ": "UVSQ",
     "SU": "SU",
@@ -30,8 +29,8 @@ RECO_COL_EXACT = (
     "Si vous avez des besoins, des demandes ou des améliorations à proposer avant le concours, écrivez-les ici !"
 )
 
-# ================== UTILS ================== #
 
+# ================== UTILS ================== #
 
 def normalize(s: str) -> str:
     if s is None:
@@ -45,34 +44,28 @@ def normalize(s: str) -> str:
 
 
 def parse_note(val):
-    """Renvoie une note sur 5 en float ou None."""
     if pd.isna(val):
         return None
     s = str(val).strip()
 
-    # 1) Forme "2/5"
     m = re.match(r"^\s*(\d+(?:[.,]\d+)?)\s*/\s*(\d+(?:[.,]\d+)?)\s*$", s)
     if m:
         num = float(m.group(1).replace(",", "."))
         den = float(m.group(2).replace(",", "."))
         return (num / den) * 5.0 if den else None
 
-    # 2) Nombre simple "2" ou "2,5"
     try:
         return float(s.replace(",", "."))
     except ValueError:
         pass
 
-    # 3) Nombre en début de chaîne "4 - Plutôt satisfait"
     m2 = re.match(r"^\s*(\d+(?:[.,]\d+)?)", s)
     if m2:
         return float(m2.group(1).replace(",", "."))
-
     return None
 
 
 def read_all_sheets(file) -> pd.DataFrame:
-    """Concatène toutes les feuilles d'un Excel uploadé."""
     try:
         xls = pd.ExcelFile(file)
         frames = []
@@ -125,17 +118,15 @@ def infer_faculty_for_row(
     nom_col: str | None,
     email_col: str | None,
 ):
-    # 1) Pseudo
     if pseudo_col and pseudo_col in row and pd.notna(row[pseudo_col]):
         f = infer_faculty_from_value(row[pseudo_col])
         if f:
             return f
-    # 2) Email
     if email_col and email_col in row and pd.notna(row[email_col]):
         f = infer_faculty_from_value(row[email_col])
         if f:
             return f
-    # 3) Prénom + Nom
+
     parts = []
     if prenom_col and prenom_col in row and pd.notna(row[prenom_col]):
         parts.append(str(row[prenom_col]))
@@ -152,9 +143,7 @@ def _is_comment_col(n: str) -> bool:
 
 # ================== LOGIQUE "NOTES & VUES" ================== #
 
-
 def build_pairs(df: pd.DataFrame):
-    """Détecte les couples (colonne note/échelle, colonne commentaire)."""
     columns = list(df.columns)
     norm = [normalize(c) for c in columns]
 
@@ -169,7 +158,6 @@ def build_pairs(df: pd.DataFrame):
         if not (is_note or is_scale):
             continue
 
-        # Chercher la colonne de commentaire dans les 2 suivantes
         comment_col = None
         for j in (i + 1, i + 2):
             if j < len(columns) and _is_comment_col(norm[j]):
@@ -178,7 +166,6 @@ def build_pairs(df: pd.DataFrame):
         if not comment_col:
             continue
 
-        # Catégorie
         if is_note:
             base = re.sub(r"\bnote\b|:|-", " ", ncol)
         else:
@@ -266,7 +253,6 @@ def build_views(
         rename_map[comm_col] = "Commentaire"
         temp.rename(columns=rename_map, inplace=True)
 
-        # Ajout fac
         temp["Fac"] = df.apply(
             lambda r: infer_faculty_for_row(r, pseudo_col, prenom_col, nom_col, email_col),
             axis=1,
@@ -284,8 +270,7 @@ def build_views(
     return sheets
 
 
-# ================== NOUVELLES VUES ================== #
-
+# ================== VUES COMMENTAIRES & RECO ================== #
 
 def build_commentaires_view(
     df: pd.DataFrame,
@@ -349,42 +334,65 @@ def build_recommandations_view(
     return pd.DataFrame(rows)
 
 
-def build_excel_bytes(
-    df_avg: pd.DataFrame,
-    standard_views: dict[str, pd.DataFrame],
-    commentaires_df: pd.DataFrame,
-    reco_df: pd.DataFrame,
-) -> bytes:
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        # Moyennes
-        df_avg.to_excel(writer, sheet_name="Moyennes", index=False)
-        # Vues <3/5
-        for view in ["Coaching", "Fiches de cours", "Professeurs", "Plateforme", "Organisation générale"]:
-            df_view = standard_views.get(view, pd.DataFrame())
-            df_view.to_excel(writer, sheet_name=view[:31], index=False)
-        # Commentaires & Recommandations
-        commentaires_df.to_excel(writer, sheet_name="Commentaires", index=False)
-        reco_df.to_excel(writer, sheet_name="Recommandations", index=False)
+# ================== VUE "TOUS LES ÉLÈVES" ================== #
 
-    output.seek(0)
-    return output.getvalue()
+def build_tous_les_eleves(
+    df: pd.DataFrame,
+    prenom_col: str | None,
+    nom_col: str | None,
+    email_col: str | None,
+    pseudo_col: str | None,
+    pairs: dict[str, tuple[str, str]],
+) -> pd.DataFrame:
+    note_cols = [note for (note, _) in pairs.values()]
+    rows = []
+    for _, r in df.iterrows():
+        notes = []
+        for note_col in note_cols:
+            val = parse_note(r.get(note_col))
+            if val is not None:
+                notes.append(val)
+        if notes:
+            avg = sum(notes) / len(notes)
+        else:
+            avg = None
+
+        fac = infer_faculty_for_row(r, pseudo_col, prenom_col, nom_col, email_col)
+        rows.append(
+            {
+                "Prénom": r.get(prenom_col, ""),
+                "Nom": r.get(nom_col, ""),
+                "Fac": FAC_DISPLAY.get(fac, fac) if fac else "",
+                "Pseudo": r.get(pseudo_col, ""),
+                "Email": r.get(email_col, ""),
+                "Moyenne globale /5": round(avg, 2) if avg is not None else None,
+            }
+        )
+    out = pd.DataFrame(rows)
+    out = out.sort_values(
+        "Moyenne globale /5", ascending=True, na_position="last"
+    ).reset_index(drop=True)
+    return out
 
 
-# ================== STREAMLIT APP ================== #
+# ================== STREAMLIT UI ================== #
 
-st.set_page_config(page_title="Feedback PASS", layout="centered")
+st.set_page_config(page_title="Feedback PASS", layout="wide")
 
-st.title("📊 Générateur de vues de feedback")
+st.markdown(
+    "<h1 style='text-align:center;'>📊 Dashboard de satisfaction – Diploma Santé</h1>",
+    unsafe_allow_html=True,
+)
 st.write(
-    "Uploade l’export brut (Excel) du formulaire, et je te génère un fichier "
-    "**vues_feedback.xlsx** avec : Moyennes, vues <3/5, Commentaires & Recommandations."
+    "Dépose l’export Excel du formulaire : la plateforme te donne directement "
+    "les moyennes par fac, les élèves en difficulté, tous les commentaires, les recommandations, "
+    "et un classement des élèves par moyenne globale."
 )
 
-uploaded = st.file_uploader("Fichier Excel exporté", type=["xlsx", "xls"])
+uploaded = st.file_uploader("Fichier Excel exporté (.xlsx ou .xls)", type=["xlsx", "xls"])
 
 if not uploaded:
-    st.info("👉 Choisis un fichier .xlsx ou .xls pour commencer.")
+    st.info("▶ Uploade un fichier pour démarrer l’analyse.")
     st.stop()
 
 try:
@@ -397,19 +405,16 @@ if df.empty:
     st.error("Le fichier ne contient aucune donnée exploitable.")
     st.stop()
 
-st.success(f"✅ Fichier chargé ({len(df)} lignes, {len(df.columns)} colonnes).")
-
-# Détection colonnes identité / pseudo
+# Détection colonnes
 prenom_col, nom_col, email_col = find_identity_columns(df)
 pseudo_col = find_pseudo_column(df)
-
 pairs = build_pairs(df)
+
 if not pairs:
     st.error(
         "Impossible de détecter les colonnes de notes/commentaires.\n\n"
         "Vérifie que les questions sont bien du type "
-        "'Sur une échelle de 0 à 5, comment évaluez-vous...'"
-        " et que les commentaires sont dans des colonnes 'Commentaire'."
+        "'Sur une échelle de 0 à 5...' et que les commentaires sont dans des colonnes 'Commentaire'."
     )
     st.stop()
 
@@ -417,20 +422,90 @@ df_avg = compute_averages_by_fac(df, pairs, pseudo_col, prenom_col, nom_col, ema
 standard_views = build_views(df, prenom_col, nom_col, email_col, pseudo_col, pairs)
 commentaires_df = build_commentaires_view(df, prenom_col, nom_col, email_col, pseudo_col)
 reco_df = build_recommandations_view(df, prenom_col, nom_col, email_col, pseudo_col)
+tous_eleves_df = build_tous_les_eleves(df, prenom_col, nom_col, email_col, pseudo_col, pairs)
 
-st.subheader("Aperçu rapide des moyennes")
-st.dataframe(df_avg)
+# ========== HEADER STATS ========== #
 
-excel_bytes = build_excel_bytes(df_avg, standard_views, commentaires_df, reco_df)
+col1, col2, col3 = st.columns(3)
+with col1:
+    st.metric("Nombre de réponses", len(df))
+with col2:
+    # moyenne globale (toutes notes toutes facs)
+    all_notes = []
+    for note_col, _ in pairs.values():
+        all_notes.extend(df[note_col].map(parse_note).dropna().tolist())
+    global_mean = round(sum(all_notes) / len(all_notes), 2) if all_notes else None
+    st.metric("Moyenne globale", f"{global_mean}/5" if global_mean is not None else "N/A")
+with col3:
+    st.metric("Facs détectées", ", ".join(sorted({f for f in tous_eleves_df["Fac"].unique() if f})) or "—")
 
-st.download_button(
-    label="📥 Télécharger vues_feedback.xlsx",
-    data=excel_bytes,
-    file_name="vues_feedback.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+# ========== TABS ========== #
+
+tab_moyennes, tab_vues, tab_comments, tab_reco, tab_eleves = st.tabs(
+    ["📈 Moyennes par fac", "⚠️ Vues < 3/5", "💬 Commentaires", "📝 Recommandations", "👥 Tous les élèves"]
 )
 
-st.caption(
-    "Le fichier contient : Moyennes, Coaching, Fiches de cours, Professeurs, "
-    "Plateforme, Organisation générale, Commentaires, Recommandations."
-)
+with tab_moyennes:
+    st.subheader("Moyennes par fac et par catégorie")
+    st.dataframe(df_avg, use_container_width=True)
+
+with tab_vues:
+    st.subheader("Élèves avec note < 3/5 par catégorie")
+    vue_name = st.selectbox(
+        "Choisis une catégorie",
+        ["Coaching", "Fiches de cours", "Professeurs", "Plateforme", "Organisation générale"],
+    )
+    df_vue = standard_views.get(vue_name)
+    if df_vue is None or df_vue.empty:
+        st.info("Aucun élève avec note < 3/5 pour cette catégorie.")
+    else:
+        fac_filter = st.multiselect(
+            "Filtrer par fac (optionnel)",
+            sorted([f for f in df_vue["Fac"].unique() if f]),
+        )
+        df_affiche = df_vue.copy()
+        if fac_filter:
+            df_affiche = df_affiche[df_affiche["Fac"].isin(fac_filter)]
+        st.dataframe(df_affiche, use_container_width=True)
+
+with tab_comments:
+    st.subheader("Tous les élèves ayant laissé au moins un commentaire")
+    if commentaires_df.empty:
+        st.info("Aucun commentaire détecté.")
+    else:
+        fac_filter = st.multiselect(
+            "Filtrer par fac (optionnel)", sorted([f for f in commentaires_df["Fac"].unique() if f]), key="fac_comments"
+        )
+        df_affiche = commentaires_df.copy()
+        if fac_filter:
+            df_affiche = df_affiche[df_affiche["Fac"].isin(fac_filter)]
+        st.dataframe(df_affiche, use_container_width=True)
+
+with tab_reco:
+    st.subheader("Recommandations / besoins avant le concours")
+    if reco_df.empty:
+        st.info("Aucune recommandation trouvée dans le champ dédié.")
+    else:
+        fac_filter = st.multiselect(
+            "Filtrer par fac (optionnel)", sorted([f for f in reco_df["Fac"].unique() if f]), key="fac_reco"
+        )
+        df_affiche = reco_df.copy()
+        if fac_filter:
+            df_affiche = df_affiche[df_affiche["Fac"].isin(fac_filter)]
+        st.dataframe(df_affiche, use_container_width=True)
+
+with tab_eleves:
+    st.subheader("Tous les élèves – classement par moyenne globale (croissant)")
+    if tous_eleves_df.empty:
+        st.info("Aucune donnée pour calculer les moyennes.")
+    else:
+        fac_filter = st.multiselect(
+            "Filtrer par fac (optionnel)", sorted([f for f in tous_eleves_df["Fac"].unique() if f]), key="fac_eleves"
+        )
+        df_affiche = tous_eleves_df.copy()
+        if fac_filter:
+            df_affiche = df_affiche[df_affiche["Fac"].isin(fac_filter)]
+        st.dataframe(
+            df_affiche[["Prénom", "Nom", "Fac", "Moyenne globale /5", "Pseudo", "Email"]],
+            use_container_width=True,
+        )
